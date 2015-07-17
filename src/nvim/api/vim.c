@@ -298,6 +298,19 @@ Object nvim_eval(String expr, Error *err)
 Object nvim_call_function(String fname, Array args, Error *err)
   FUNC_API_SINCE(1)
 {
+  return call_function(fname, args, NULL, err);
+}
+
+
+/// Call an internal or user defined function.
+///
+/// @param fname Function name
+/// @param args Function arguments
+/// @param self self dictionary (only required for dict functions)
+/// @param[out] err Details of an error that may have occurred
+/// @return Result of the function call
+static Object call_function(String fname, Array args, dict_T *self, Error *err)
+{
   Object rv = OBJECT_INIT;
   if (args.size > MAX_FUNC_ARGS) {
     api_set_error(err, kErrorTypeValidation,
@@ -321,7 +334,9 @@ Object nvim_call_function(String fname, Array args, Error *err)
   int r = call_func((char_u *)fname.data, (int)fname.size,
                     &rettv, (int)args.size, vim_args, NULL,
                     curwin->w_cursor.lnum, curwin->w_cursor.lnum, &dummy,
-                    true, NULL, NULL);
+                    true,
+                    NULL,
+                    self);
   if (r == FAIL) {
     api_set_error(err, kErrorTypeException, "Error calling function.");
   }
@@ -337,6 +352,104 @@ free_vim_args:
 
   return rv;
 }
+
+
+/// Call the given dict function with the given arguments stored in an array.
+///
+/// @param self self dictionary or a string expression evaluating to a
+///        dictionary
+/// @param internal true if the function is stored in the self dict
+/// @param fname Function to call
+/// @param args Functions arguments packed in an Array
+/// @param[out] err Details of an error that may have occurred
+/// @return Result of the function call
+Object nvim_call_dict_function(Object self, Boolean internal, String fname,
+                              Array args, Error *err)
+  FUNC_API_SINCE(4)
+{
+  Object rv = OBJECT_INIT;
+  dict_T *self_dict = NULL;
+
+  // Assign dictionary to self_dict
+  typval_T *tmp_dict = NULL;
+  typval_T rettv;  // implicitly freed when tmp_dict is freed
+  bool clear_after_eval = false;
+  switch (self.type) {
+    case kObjectTypeString:
+      try_start();
+      if (eval0((char_u *) self.data.string.data, tmp_dict, NULL, TRUE) == FAIL) {
+        api_set_error(err, kErrorTypeException,
+                _("Failed to evaluate self expression"));
+      }
+      if (try_end(err)) {
+        return rv;
+      }
+      // The evaluation of the string argument either created a new dictionary or
+      // it increased the reference count of a dictionary. So we have to call
+      // tv_free on the dict in the end. This is not necessary for a dict inside a
+      // msgpack-rpc object
+      clear_after_eval = true;
+      break;
+    case kObjectTypeDictionary:
+      if (internal) {
+        api_set_error(err, kErrorTypeValidation,
+            _("Function references are not supported for msgpack-rpc dictionaries")); // NOLINT
+        return rv;
+      } else if (!object_to_vim(self, &rettv, err)) {
+        tv_free(&rettv);
+        return rv;
+      }
+      tmp_dict = &rettv;
+      break;
+    default:
+      api_set_error(err, kErrorTypeValidation,
+          _("self Argument is neither a string nor a dictionary"));
+      return rv;
+  }
+  self_dict = tmp_dict->vval.v_dict;
+  if (!self_dict) {
+    api_set_error(err, kErrorTypeValidation,
+        _("Referenced self dictionary does not exist"));
+    goto cleanup_dict;
+  }
+
+  // Set the function to call
+  String func = STRING_INIT;
+  if (internal /* && self.type == kObjectTypeString */) {
+    hashitem_T *f = hash_find(&self_dict->dv_hashtab, (char_u *) fname.data);
+    if (!f || HASHITEM_EMPTY(f)) {
+      api_set_error(err, kErrorTypeValidation,
+          _("Function not found in self dictionary"));
+      goto cleanup_dict;
+    }
+    dictitem_T *ifname = TV_DICT_HI2DI(f);
+    if (ifname->di_tv.v_type != VAR_STRING) {
+      api_set_error(err, kErrorTypeValidation,
+          _("Value inside self dictionary is not a valid function name"));
+      goto cleanup_dict;
+    }
+    func.data = (char *) ifname->di_tv.vval.v_string;
+    func.size = STRLEN(func.data);
+  } else {
+    func.data = fname.data;
+    func.size = fname.size;
+  }
+  if (!func.data || func.size < 1) {
+    api_set_error(err, kErrorTypeValidation,
+        _("Trying to call an empty function"));
+    goto cleanup_dict;
+  }
+
+  // Finally try to call the function
+  rv = call_function(func, args, self_dict, err);
+cleanup_dict:
+  if (clear_after_eval) {
+    tv_free(tmp_dict);
+  }
+
+  return rv;
+}
+
 
 /// Execute lua code. Parameters (if any) are available as `...` inside the
 /// chunk. The chunk can return a value.
